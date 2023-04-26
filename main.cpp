@@ -13,6 +13,7 @@
 
 #include "sim86_shared.h"
 #include <fstream>
+#include <cassert>
 
 unsigned char ExampleDisassembly[1024 * 1024];
 
@@ -39,6 +40,8 @@ static s32 Registers[REGISTERS_COUNT] =
     0x0000
 };
 
+static int32_t memory[1024 * 1024];
+static int32_t ip;
 static int16_t flags;
 static char const* Names[REGISTERS_COUNT] =
 {
@@ -66,11 +69,13 @@ struct DiffPrinter {
 
     s32 RegistersSnapshot[REGISTERS_COUNT];
     int16_t flagsSnapshot;
+    int32_t ipsnapshot;
 
     DiffPrinter()
     {
         memcpy(&RegistersSnapshot, Registers, sizeof(Registers));
         flagsSnapshot = flags;
+        ipsnapshot = ip;
     }
 
     void CompareFlags(int shift, const char* name) {
@@ -96,6 +101,10 @@ struct DiffPrinter {
             CompareFlags(ZERO_FLAG_SHIFT, "zero");
             CompareFlags(SIGN_FLAG_SHIFT, "sign");
         }
+
+        if (ipsnapshot != ip) {
+            printf(" ip: 0x%02x -> 0x%02x (%i->%i)", ipsnapshot, ip, ipsnapshot, ip);
+        }
     } 
 };
 
@@ -106,6 +115,26 @@ void setFlag(int shift, bool value) {
     else {
         flags &= (~(1 << shift));
     }
+}
+
+bool getFlag(int shift) {
+	return (flags >> shift) & 1;
+}
+
+s32 getDisplacement(instruction_operand& operand) {
+    s32 displacement = 0;
+    auto firstRegister = operand.Address.Terms[0];
+    if (firstRegister.Register.Index != 0) {
+        displacement += Registers[firstRegister.Register.Index];
+    }
+
+    auto secondRegister = operand.Address.Terms[1];
+    if (secondRegister.Register.Index != 0) {
+        displacement += Registers[secondRegister.Register.Index];
+    }
+
+    displacement += operand.Address.Displacement;
+    return displacement;
 }
 
 int main(void)
@@ -124,46 +153,59 @@ int main(void)
 
     FILE* File = {};
     size_t readCount = 0;
-    if (fopen_s(&File, "resources/test", "rb") == 0)
+    if (fopen_s(&File, "resources/listing_0052_memory_add_loop", "rb") == 0)
     {
         readCount = fread(ExampleDisassembly, 1, sizeof(ExampleDisassembly), File);
         fclose(File);
     }
 
-    u32 Offset = 0;
-    while (Offset < readCount)
+    ip = 0;
+    while (ip < readCount)
     {
         DiffPrinter printer{};
         instruction Decoded;
-        Sim86_Decode8086Instruction(sizeof(ExampleDisassembly) - Offset, ExampleDisassembly + Offset, &Decoded);
+        Sim86_Decode8086Instruction(sizeof(ExampleDisassembly) - ip, ExampleDisassembly + ip, &Decoded);
+
         if (Decoded.Op)
         {
+            ip += Decoded.Size;
+
             switch (Decoded.Op)
             {
             case Op_mov:
             {
-                auto destination = Decoded.Operands[0];
-                auto source = Decoded.Operands[1];
-                if (destination.Type == operand_type::Operand_Register) {
+                auto destinationOperand = Decoded.Operands[0];
+                auto sourceOperand = Decoded.Operands[1];
 
-                    s32* destinationRegister = &Registers[destination.Register.Index];
-                    int16_t sourceValue = 0;
+                bool word = true;
+                int16_t sourceValue = 0;
 
-                    if (source.Type == operand_type::Operand_Immediate) {
-                        sourceValue = source.Immediate.Value;
-                    }
-                    else if (source.Type == operand_type::Operand_Register) {
-                        sourceValue = Registers[source.Register.Index];
-                    }
+                int32_t* destination = nullptr;
 
-                    if (destination.Register.Count == 2)
-                    {
-                        *destinationRegister = sourceValue;
-                    }
-                    else {
-                        *(((char*)destinationRegister) + (destination.Register.Offset & 1)) = (char)sourceValue;
-                    }
+                if (destinationOperand.Type == operand_type::Operand_Register) {
+                    destination = &Registers[destinationOperand.Register.Index];                  
                 }
+                else if (destinationOperand.Type == operand_type::Operand_Memory) {                    
+                    destination = &memory[getDisplacement(destinationOperand)];
+                }
+                else {
+                    assert(false);
+                }
+
+                if (sourceOperand.Type == operand_type::Operand_Immediate) {
+                    sourceValue = sourceOperand.Immediate.Value;
+                }
+                else if (sourceOperand.Type == operand_type::Operand_Register) {
+                    sourceValue = Registers[sourceOperand.Register.Index];
+                }
+                else if (sourceOperand.Type == operand_type::Operand_Memory) {
+                    sourceValue = memory[getDisplacement(sourceOperand)];
+                }
+                else {
+                    assert(false);
+                }
+
+                *destination = sourceValue;
 
                 break;
             }
@@ -232,11 +274,16 @@ int main(void)
 
                 break;
             }
+            case Op_jne: {
+                if (!getFlag(ZERO_FLAG_SHIFT))
+                    ip += Decoded.Operands[0].Immediate.Value;
+                break;
+            }
             default:
+                printf("Unhandled instruction %i", Decoded.Op);
                 break;
             }
 
-            Offset += Decoded.Size;
             printf("\n");
         }
         else
@@ -250,8 +297,13 @@ int main(void)
     printf("Final state\n");
     for (size_t registerIndex = 0; registerIndex < REGISTERS_COUNT; registerIndex++)
     {
+        if (Registers[registerIndex] == 0)
+            continue;
+
         printf("%s: 0x%02x\n", Names[registerIndex], Registers[registerIndex]);
     }
+    printf("IP: %i\n", ip);
+    
 
     return 0;
 }
